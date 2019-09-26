@@ -1,0 +1,11 @@
+Channels
+	roadblock/
+		history - all roadblocks that were run during the lifetime of the message queue
+
+		expired - a list of any roadblock(s) that hit their timeout 
+			- this can be used as a hint to newly arrived members to exit prematurely -- whether it's the leader or the follower(s)
+			- this is a subset of history
+
+		closed - a list of roadblock(s) that were successfully complted
+		       - this is probably just used for debugging purposes
+		       - this is a subset of history
