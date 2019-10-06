@@ -51,13 +51,15 @@ def process_options ():
 def cleanup(redcon):
     redcon.delete(t_global.args.roadblock_uuid)
     redcon.delete(t_global.args.roadblock_uuid + '__timeout')
-    redcon.delete(t_global.args.roadblock_uuid + '__status')
+    redcon.delete(t_global.args.roadblock_uuid + '__initialized')
+    redcon.delete(t_global.args.roadblock_uuid + '__online-status')
     return(0)
 
 def main():
     process_options()
 
-    followers = { 'ready': {},
+    followers = { 'online': {},
+                  'ready': {},
                   'gone': {} }
     if t_global.args.roadblock_role == 'leader':
         if len(t_global.args.roadblock_followers) == 0:
@@ -65,6 +67,7 @@ def main():
             return(-1)
         
         for follower in t_global.args.roadblock_followers:
+            followers['online'][follower] = True
             followers['ready'][follower] = True
             followers['gone'][follower] = True
     
@@ -81,98 +84,137 @@ def main():
     
     mytime = calendar.timegm(time.gmtime())
     timeout = mytime + t_global.args.roadblock_timeout
-    if t_global.args.roadblock_role == 'leader' and redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
-    #if redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
+    #if t_global.args.roadblock_role == 'leader' and redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
+    if redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
         # i am creating the roadblock
-        print("first!")
+        print("Initializing roadblock as first arriving member")
         redcon.msetnx({t_global.args.roadblock_uuid + '__timeout': timeout})
-        redcon.rpush(t_global.args.roadblock_uuid + '__status', 'initialized')
+        redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'initialized')
+        redcon.rpush(t_global.args.roadblock_uuid + '__initialized', int(True))
     else:
         # the roadblock already exists, make sure it is initialized
         # completely before proceeding
-        print("not first...")
-        while not redcon.exists(t_global.args.roadblock_uuid + '__status'):
+        print("I am not the first arriving member, waiting for roadblock initialization to complete")
+
+        # wait until the initialized flag has been set for the roadblock
+        while not redcon.exists(t_global.args.roadblock_uuid + '__initialized'):
             time.sleep(1)
             print(".")
 
+        print("Roadblock is initialized")
+
+        # retrieve the posted timeout so that the same timestamp is
+        # shared across all members of the roadblock
         timeout = redcon.get(t_global.args.roadblock_uuid + '__timeout')
 
     print("Timeout: %s" % (datetime.datetime.utcfromtimestamp(int(timeout)).strftime("%H:%M:%S on %Y-%m-%d")))
 
-    stage = 0
+    state = 0
     status_index = -1
-    followers_ready = 0
     while True:
-        status_list = redcon.lrange(t_global.args.roadblock_uuid + '__status', status_index+1, -1)
-        for msg in status_list:
-            status_index += 1
-            msg = msg.decode()
-            print("received msg=[%s] status_index=[%d]" % (msg, status_index))
-            
-            if msg == 'initialized':
-                state = 1
-            elif msg == 'leader_ready':
-                state = 2
-            elif msg == 'followers_ready':
-                followers_ready += 1
+        # retrieve unprocessed status messages
+        status_list = redcon.lrange(t_global.args.roadblock_uuid + '__online-status', status_index+1, -1)
 
-        if t_global.args.roadblock_role == 'leader' and state == 2 and followers_ready == len(t_global.args.roadblock_followers):
-            state = 3
+        # process any retrieved status messages
+        if len(status_list):
+            for msg in status_list:
+                status_index += 1
+                msg = msg.decode().split('/')
+                #print("received msg=[%s] status_index=[%d]" % (msg, status_index))
                 
+                if msg[0] == 'initialized':
+                    state = 1
+                elif msg[0] == 'leader_online':
+                    if t_global.args.roadblock_role == 'follower':
+                        print("Received online status from leader")
+                    state = 2
+                elif t_global.args.roadblock_role == 'leader' and msg[1] == 'online':
+                    if msg[0] in followers['online']:
+                        print("Received online status from '%s'" % (msg[0]))
+                        del followers['online'][msg[0]]
+                    elif msg[0] in t_global.args.roadblock_followers:
+                        print("Did I already process this online message from follower '%s'?" % (msg[0]))
+                    else:
+                        print("Received online message from unknown follower '%s'" % (msg[0]))
+        #else:
+        #    print("No online-status messages received")
+
+        #print("state=%d" % (state))
+
         if state == 1:
             if t_global.args.roadblock_role == 'leader':
-                pubsubcon.psubscribe(t_global.args.roadblock_uuid + '__followers__*')
-                redcon.rpush(t_global.args.roadblock_uuid + '__status', 'leader_ready')
+                # listen for messages published from the followers
+                pubsubcon.subscribe(t_global.args.roadblock_uuid + '__followers')
+
+                print("Signaling online")
+                redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'leader_online')
         elif state == 2:
             if t_global.args.roadblock_role == 'follower':
-                print("Signaling ready")
-                redcon.publish(t_global.args.roadblock_uuid + '__followers__' + t_global.args.roadblock_follower_id, 'ready')
-                redcon.rpush(t_global.args.roadblock_uuid + '__status', 'followers_ready')
+                print("Signaling online")
+                redcon.rpush(t_global.args.roadblock_uuid + '__online-status', t_global.args.roadblock_follower_id + '/online')
+
+                print("Publishing ready message")
+                redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/ready')
+
+                # listen for messages published from the leader
                 pubsubcon.subscribe(t_global.args.roadblock_uuid + '__leader')
-                state = 3
-        elif state == 3:
-            if t_global.args.roadblock_role == 'leader':
-                for msg in pubsubcon.listen():
-                    #print(msg)
-                    channel = msg['channel'].decode().split("__")
-                    if msg['data'].decode() == 'ready':
-                        print("Received ready from %s" % (channel[2]))
-                        del followers['ready'][channel[2]]
+                break
+            elif t_global.args.roadblock_role == 'leader' and len(followers['online']) == 0:
+                print("All followers online")
+                break
 
-                    if len(followers['ready']) == 0:
-                        print("All followers ready")
-                        print("Signaling go")
-                        redcon.publish(t_global.args.roadblock_uuid + '__leader', "go")
-                        state = 4
-                        break
-            elif t_global.args.roadblock_role == 'follower':
-                for msg in pubsubcon.listen():
-                    #print(msg)
-                    if msg['data'].decode() == 'go':
-                        print("Received go from leader")
-                        print("Signaling gone")
-                        redcon.publish(t_global.args.roadblock_uuid + '__followers__' + t_global.args.roadblock_follower_id, 'gone')
-                        print("Exiting")
-                        return(0)
-        elif state == 4:
-            if t_global.args.roadblock_role == 'leader':
-                for msg in pubsubcon.listen():
-                    #print(msg)
-                    channel = msg['channel'].decode().split("__")
-                    if msg['data'].decode() == 'gone':
-                        print("Received gone from %s" % (channel[2]))
-                        del followers['gone'][channel[2]]
+        time.sleep(1)
 
-                    if len(followers['gone']) == 0:
-                        print("All followers gone")
-                        print("Cleaning up")
-                        cleanup(redcon)
-                        break
+    if t_global.args.roadblock_role == 'leader':
+        for msg in pubsubcon.listen():
+            #print(msg)
+            msg = msg['data'].decode().split('/')
+            if msg[1] == 'ready':
+                if msg[0] in followers['ready']:
+                    print("Received ready message from '%s'" % (msg[0]))
+                    del followers['ready'][msg[0]]
+                elif msg[0] in t_global.args.roadblock_followers:
+                    print("Did I already process this ready message from follower '%s'?" % (msg[0]))
+                else:
+                    print("Received ready message from unknown follower '%s'" % (msg[0]))
 
+            if len(followers['ready']) == 0:
+                print("All followers ready")
+                print("Publishing go message")
+                redcon.publish(t_global.args.roadblock_uuid + '__leader', "go")
+                state = 4
+                break
+    elif t_global.args.roadblock_role == 'follower':
+        for msg in pubsubcon.listen():
+            #print(msg)
+            if msg['data'].decode() == 'go':
+                print("Received go message from leader")
+                print("Publishing gone message")
+                redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/gone')
                 print("Exiting")
                 return(0)
 
-        time.sleep(1)
+    if t_global.args.roadblock_role == 'leader':
+        for msg in pubsubcon.listen():
+            #print(msg)
+            msg = msg['data'].decode().split('/')
+            if msg[1] == 'gone':
+                if msg[0] in followers['gone']:
+                    print("Received gone message from '%s'" % (msg[0]))
+                    del followers['gone'][msg[0]]
+                elif msg[0] in t_global.args.roadblock_followers:
+                    print("Did I already process this gone message from follower '%s'?" % (msg[0]))
+                else:
+                    print("Received gone message from unknown follower '%s'" % (msg[0]))
+
+            if len(followers['gone']) == 0:
+                print("All followers gone")
+                print("Cleaning up")
+                cleanup(redcon)
+                break
+
+        print("Exiting")
+        return(0)
 
 if __name__ == "__main__":
     exit(main())
