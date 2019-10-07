@@ -1,11 +1,8 @@
 #!/usr/bin/python3
 
-import sys, getopt
 import argparse
-import json
 import string
 import datetime
-import math
 import time
 import calendar
 import socket
