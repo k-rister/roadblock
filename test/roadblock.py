@@ -41,6 +41,18 @@ def process_options ():
                         default = socket.getfqdn(),
                         type = str)
 
+    parser.add_argument('--redis-server',
+                        dest = 'roadblock_redis_server',
+                        help = 'What is network name for the redis server (hostname or IP address).',
+                        default = 'localhost',
+                        type = str)
+
+    parser.add_argument('--redis-password',
+                        dest = 'roadblock_redis_password',
+                        help = 'What is password used to connect to the redis server.',
+                        default = 'foobar',
+                        type = str)
+
     parser.add_argument('--followers',
                         dest = 'roadblock_followers',
                         help = 'Use one or more times on the leader to specify the followers by name.',
@@ -104,9 +116,9 @@ def main():
 
     signal.signal(signal.SIGALRM, sighandler)
 
-    t_global.redcon = redis.Redis(host = '10.88.0.10',
-                         port = 6379,
-                         password = '')
+    t_global.redcon = redis.Redis(host = t_global.args.roadblock_redis_server,
+                                  port = 6379,
+                                  password = t_global.args.roadblock_redis_password)
     t_global.pubsubcon = t_global.redcon.pubsub(ignore_subscribe_messages = True)
 
     print("Role: %s" % (t_global.args.roadblock_role))
