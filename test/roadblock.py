@@ -58,8 +58,7 @@ def cleanup(redcon):
 def main():
     process_options()
 
-    followers = { 'online': {},
-                  'ready': {},
+    followers = { 'ready': {},
                   'gone': {} }
     if t_global.args.roadblock_role == 'leader':
         if len(t_global.args.roadblock_followers) == 0:
@@ -67,7 +66,6 @@ def main():
             return(-1)
         
         for follower in t_global.args.roadblock_followers:
-            followers['online'][follower] = True
             followers['ready'][follower] = True
             followers['gone'][follower] = True
     
@@ -128,14 +126,6 @@ def main():
                     if t_global.args.roadblock_role == 'follower':
                         print("Received online status from leader")
                     state = 2
-                elif t_global.args.roadblock_role == 'leader' and msg[1] == 'online':
-                    if msg[0] in followers['online']:
-                        print("Received online status from '%s'" % (msg[0]))
-                        del followers['online'][msg[0]]
-                    elif msg[0] in t_global.args.roadblock_followers:
-                        print("Did I already process this online message from follower '%s'?" % (msg[0]))
-                    else:
-                        print("Received online message from unknown follower '%s'" % (msg[0]))
         #else:
         #    print("No online-status messages received")
 
@@ -148,19 +138,15 @@ def main():
 
                 print("Signaling online")
                 redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'leader_online')
+
+                break
         elif state == 2:
             if t_global.args.roadblock_role == 'follower':
-                print("Signaling online")
-                redcon.rpush(t_global.args.roadblock_uuid + '__online-status', t_global.args.roadblock_follower_id + '/online')
+                # listen for messages published from the leader
+                pubsubcon.subscribe(t_global.args.roadblock_uuid + '__leader')
 
                 print("Publishing ready message")
                 redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/ready')
-
-                # listen for messages published from the leader
-                pubsubcon.subscribe(t_global.args.roadblock_uuid + '__leader')
-                break
-            elif t_global.args.roadblock_role == 'leader' and len(followers['online']) == 0:
-                print("All followers online")
                 break
 
         time.sleep(1)
