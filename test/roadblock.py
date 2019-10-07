@@ -7,9 +7,13 @@ import time
 import calendar
 import socket
 import redis
+import signal
 
 class t_global(object):
-    args=None;
+    args = None
+    redcon = None
+    pubsubcon = None
+    first = False
 
 def process_options ():
     parser = argparse.ArgumentParser(usage="roadblock testing");
@@ -45,18 +49,43 @@ def process_options ():
 
     t_global.args = parser.parse_args();
 
-def cleanup(redcon, pubsubcon):
+
+def cleanup():
+    print("Disabling timeout alarm")
+    signal.alarm(0)
+
     if t_global.args.roadblock_role == 'leader':
         print("Removing db objects specific to this roadblock")
-        redcon.delete(t_global.args.roadblock_uuid)
-        redcon.delete(t_global.args.roadblock_uuid + '__timeout')
-        redcon.delete(t_global.args.roadblock_uuid + '__initialized')
-        redcon.delete(t_global.args.roadblock_uuid + '__online-status')
+        t_global.redcon.delete(t_global.args.roadblock_uuid)
+        t_global.redcon.delete(t_global.args.roadblock_uuid + '__timeout-timestamp')
+        t_global.redcon.delete(t_global.args.roadblock_uuid + '__initialized')
+        t_global.redcon.delete(t_global.args.roadblock_uuid + '__online-status')
 
     print("Closing connections")
-    pubsubcon.close()
-    redcon.close()
+    t_global.pubsubcon.close()
+    t_global.redcon.close()
 
+    return(0)
+
+
+def do_timeout():
+    print("The roadblock has timed out")
+    if t_global.first:
+        # set a persistent flag that the roadblock timed out so that
+        # any late arriving members know that the roadblock has
+        # already failed.  done by the first member since that is the
+        # only member that is guaranteed to have actually reached the
+        # roadblock and be capable of setting this.
+        t_global.redcon.msetnx({t_global.args.roadblock_uuid + '__timedout': int(True)})
+    cleanup()
+    exit(-3)
+
+
+def sighandler(signum, frame):
+    if signum == 14:
+        do_timeout()
+    else:
+        print('Signal handler called with signal', signum)
     return(0)
 
 def main():
@@ -72,49 +101,74 @@ def main():
         for follower in t_global.args.roadblock_followers:
             followers['ready'][follower] = True
             followers['gone'][follower] = True
-    
-    redcon = redis.Redis(host = '10.88.0.10',
+
+    signal.signal(signal.SIGALRM, sighandler)
+
+    t_global.redcon = redis.Redis(host = '10.88.0.10',
                          port = 6379,
                          password = '')
-    pubsubcon = redcon.pubsub(ignore_subscribe_messages = True)
+    t_global.pubsubcon = t_global.redcon.pubsub(ignore_subscribe_messages = True)
 
     print("Role: %s" % (t_global.args.roadblock_role))
     if t_global.args.roadblock_role == 'follower':
         print("Follower ID: %s" % (t_global.args.roadblock_follower_id))
     elif t_global.args.roadblock_role == 'leader':
         print("Followers: %s" % (t_global.args.roadblock_followers))
-    
+
+    # check if the roadblock was previously created and already timed
+    # out -- ie. I am very late
+    if t_global.redcon.exists(t_global.args.roadblock_uuid + '__timedout'):
+        do_timeout()
+
+    # set the default timeout alarm
+    signal.alarm(t_global.args.roadblock_timeout)
     mytime = calendar.timegm(time.gmtime())
-    timeout = mytime + t_global.args.roadblock_timeout
-    if redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
+    print("Current Time: %s" % (datetime.datetime.utcfromtimestamp(mytime).strftime("%Y-%m-%d at %H:%M:%S UTC")))
+    cluster_timeout = mytime + t_global.args.roadblock_timeout
+    if t_global.redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
         # i am creating the roadblock
         print("Initializing roadblock as first arriving member")
-        redcon.msetnx({t_global.args.roadblock_uuid + '__timeout': timeout})
-        redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'initialized')
-        redcon.rpush(t_global.args.roadblock_uuid + '__initialized', int(True))
+        t_global.redcon.msetnx({t_global.args.roadblock_uuid + '__timeout-timestamp': cluster_timeout})
+        t_global.redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'initialized')
+        t_global.redcon.rpush(t_global.args.roadblock_uuid + '__initialized', int(True))
+        t_global.first = True
     else:
         # the roadblock already exists, make sure it is initialized
         # completely before proceeding
         print("I am not the first arriving member, waiting for roadblock initialization to complete")
 
         # wait until the initialized flag has been set for the roadblock
-        while not redcon.exists(t_global.args.roadblock_uuid + '__initialized'):
+        while not t_global.redcon.exists(t_global.args.roadblock_uuid + '__initialized'):
             time.sleep(1)
             print(".")
 
         print("Roadblock is initialized")
 
         # retrieve the posted timeout so that the same timestamp is
-        # shared across all members of the roadblock
-        timeout = redcon.get(t_global.args.roadblock_uuid + '__timeout')
+        # shared across all members of the roadblock for timing out --
+        # this allows even late arrivals to share the same timeout
+        # timestamp
+        cluster_timeout = int(t_global.redcon.get(t_global.args.roadblock_uuid + '__timeout-timestamp'))
+        mytime = calendar.timegm(time.gmtime())
+        timeout = mytime - cluster_timeout
+        if timeout < 0:
+            # the timeout is still in the future, update the alarm
+            signal.alarm(abs(timeout))
+            print("The new timeout value is in %d seconds" % (abs(timeout)))
+        else:
+            signal.alarm(0)
+            # the timeout has already passed
+            print("The timeout has already occurred")
+            cleanup()
+            return(-2)
 
-    print("Timeout: %s" % (datetime.datetime.utcfromtimestamp(int(timeout)).strftime("%H:%M:%S on %Y-%m-%d")))
+    print("Timeout: %s" % (datetime.datetime.utcfromtimestamp(cluster_timeout).strftime("%Y-%m-%d at %H:%M:%S UTC")))
 
     state = 0
     status_index = -1
     while True:
         # retrieve unprocessed status messages
-        status_list = redcon.lrange(t_global.args.roadblock_uuid + '__online-status', status_index+1, -1)
+        status_list = t_global.redcon.lrange(t_global.args.roadblock_uuid + '__online-status', status_index+1, -1)
 
         # process any retrieved status messages
         if len(status_list):
@@ -133,25 +187,25 @@ def main():
         if state == 1:
             if t_global.args.roadblock_role == 'leader':
                 # listen for messages published from the followers
-                pubsubcon.subscribe(t_global.args.roadblock_uuid + '__followers')
+                t_global.pubsubcon.subscribe(t_global.args.roadblock_uuid + '__followers')
 
                 print("Signaling online")
-                redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'leader_online')
+                t_global.redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'leader_online')
 
                 break
         elif state == 2:
             if t_global.args.roadblock_role == 'follower':
                 # listen for messages published from the leader
-                pubsubcon.subscribe(t_global.args.roadblock_uuid + '__leader')
+                t_global.pubsubcon.subscribe(t_global.args.roadblock_uuid + '__leader')
 
                 print("Publishing ready message")
-                redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/ready')
+                t_global.redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/ready')
                 break
 
         time.sleep(1)
 
     if t_global.args.roadblock_role == 'leader':
-        for msg in pubsubcon.listen():
+        for msg in t_global.pubsubcon.listen():
             #print(msg)
             msg = msg['data'].decode().split('/')
             if msg[1] == 'ready':
@@ -166,24 +220,24 @@ def main():
             if len(followers['ready']) == 0:
                 print("All followers ready")
                 print("Publishing go message")
-                redcon.publish(t_global.args.roadblock_uuid + '__leader', "go")
+                t_global.redcon.publish(t_global.args.roadblock_uuid + '__leader', "go")
                 break
     elif t_global.args.roadblock_role == 'follower':
-        for msg in pubsubcon.listen():
+        for msg in t_global.pubsubcon.listen():
             #print(msg)
             if msg['data'].decode() == 'go':
                 print("Received go message from leader")
                 # stop listening for messages published from the leader
-                pubsubcon.unsubscribe(t_global.args.roadblock_uuid + '__leader')
+                t_global.pubsubcon.unsubscribe(t_global.args.roadblock_uuid + '__leader')
                 print("Publishing gone message")
-                redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/gone')
+                t_global.redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/gone')
                 print("Cleaning up")
-                cleanup(redcon, pubsubcon)
+                cleanup()
                 print("Exiting")
                 return(0)
 
     if t_global.args.roadblock_role == 'leader':
-        for msg in pubsubcon.listen():
+        for msg in t_global.pubsubcon.listen():
             #print(msg)
             msg = msg['data'].decode().split('/')
             if msg[1] == 'gone':
@@ -198,9 +252,9 @@ def main():
             if len(followers['gone']) == 0:
                 print("All followers gone")
                 # stop listening for messages published from the followers
-                pubsubcon.unsubscribe(t_global.args.roadblock_uuid + '__followers')
+                t_global.pubsubcon.unsubscribe(t_global.args.roadblock_uuid + '__followers')
                 print("Cleaning up")
-                cleanup(redcon,pubsubcon)
+                cleanup()
                 print("Exiting")
                 return(0)
 
