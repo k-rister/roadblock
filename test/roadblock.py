@@ -9,6 +9,7 @@ import socket
 import redis
 import signal
 
+# define some global variables
 class t_global(object):
     args = None
     redcon = None
@@ -94,10 +95,11 @@ def do_timeout():
 
 
 def sighandler(signum, frame):
-    if signum == 14:
+    if signum == 14: # SIGALRM
         do_timeout()
     else:
         print('Signal handler called with signal', signum)
+
     return(0)
 
 def main():
@@ -105,17 +107,22 @@ def main():
 
     followers = { 'ready': {},
                   'gone': {} }
+
     if t_global.args.roadblock_role == 'leader':
         if len(t_global.args.roadblock_followers) == 0:
             print("ERROR: There must be at least one follower")
             return(-1)
-        
+
+        # build some hashes for easy tracking of follower status
         for follower in t_global.args.roadblock_followers:
             followers['ready'][follower] = True
             followers['gone'][follower] = True
 
+    # define a signal handler that will respond to SIGALRM when a
+    # timeout even occurs
     signal.signal(signal.SIGALRM, sighandler)
 
+    # create the redis connections
     t_global.redcon = redis.Redis(host = t_global.args.roadblock_redis_server,
                                   port = 6379,
                                   password = t_global.args.roadblock_redis_password)
@@ -137,6 +144,8 @@ def main():
     mytime = calendar.timegm(time.gmtime())
     print("Current Time: %s" % (datetime.datetime.utcfromtimestamp(mytime).strftime("%Y-%m-%d at %H:%M:%S UTC")))
     cluster_timeout = mytime + t_global.args.roadblock_timeout
+
+    # check if the roadblock has been initialized yet
     if t_global.redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
         # i am creating the roadblock
         print("Initializing roadblock as first arriving member")
@@ -176,8 +185,8 @@ def main():
 
     print("Timeout: %s" % (datetime.datetime.utcfromtimestamp(cluster_timeout).strftime("%Y-%m-%d at %H:%M:%S UTC")))
 
-    state = 0
     status_index = -1
+    get_out = False
     while True:
         # retrieve unprocessed status messages
         status_list = t_global.redcon.lrange(t_global.args.roadblock_uuid + '__online-status', status_index+1, -1)
@@ -190,35 +199,35 @@ def main():
                 #print("received msg=[%s] status_index=[%d]" % (msg, status_index))
                 
                 if msg[0] == 'initialized':
-                    state = 1
+                    if t_global.args.roadblock_role == 'leader':
+                        # listen for messages published from the followers
+                        t_global.pubsubcon.subscribe(t_global.args.roadblock_uuid + '__followers')
+
+                        print("Signaling online")
+                        t_global.redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'leader_online')
+
+                        get_out = True
                 elif msg[0] == 'leader_online':
                     if t_global.args.roadblock_role == 'follower':
                         print("Received online status from leader")
-                    state = 2
 
-        if state == 1:
-            if t_global.args.roadblock_role == 'leader':
-                # listen for messages published from the followers
-                t_global.pubsubcon.subscribe(t_global.args.roadblock_uuid + '__followers')
+                        # listen for messages published from the leader
+                        t_global.pubsubcon.subscribe(t_global.args.roadblock_uuid + '__leader')
 
-                print("Signaling online")
-                t_global.redcon.rpush(t_global.args.roadblock_uuid + '__online-status', 'leader_online')
+                        print("Publishing ready message")
+                        t_global.redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/ready')
 
-                break
-        elif state == 2:
-            if t_global.args.roadblock_role == 'follower':
-                # listen for messages published from the leader
-                t_global.pubsubcon.subscribe(t_global.args.roadblock_uuid + '__leader')
+                        get_out = True
 
-                print("Publishing ready message")
-                t_global.redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/ready')
-                break
-
-        time.sleep(1)
+        if get_out:
+            break
+        else:
+            time.sleep(1)
 
     if t_global.args.roadblock_role == 'leader':
         for msg in t_global.pubsubcon.listen():
             #print(msg)
+            # msg should be in the format "<follower name>/<status>"
             msg = msg['data'].decode().split('/')
             if msg[1] == 'ready':
                 if msg[0] in followers['ready']:
@@ -251,6 +260,7 @@ def main():
     if t_global.args.roadblock_role == 'leader':
         for msg in t_global.pubsubcon.listen():
             #print(msg)
+            # msg should be in the format "<follower name>/<status>"
             msg = msg['data'].decode().split('/')
             if msg[1] == 'gone':
                 if msg[0] in followers['gone']:
