@@ -48,11 +48,18 @@ def process_options ():
 
     t_global.args = parser.parse_args();
 
-def cleanup(redcon):
-    redcon.delete(t_global.args.roadblock_uuid)
-    redcon.delete(t_global.args.roadblock_uuid + '__timeout')
-    redcon.delete(t_global.args.roadblock_uuid + '__initialized')
-    redcon.delete(t_global.args.roadblock_uuid + '__online-status')
+def cleanup(redcon, pubsubcon):
+    if t_global.args.roadblock_role == 'leader':
+        print("Removing db objects specific to this roadblock")
+        redcon.delete(t_global.args.roadblock_uuid)
+        redcon.delete(t_global.args.roadblock_uuid + '__timeout')
+        redcon.delete(t_global.args.roadblock_uuid + '__initialized')
+        redcon.delete(t_global.args.roadblock_uuid + '__online-status')
+
+    print("Closing connections")
+    pubsubcon.close()
+    redcon.close()
+
     return(0)
 
 def main():
@@ -169,8 +176,12 @@ def main():
             #print(msg)
             if msg['data'].decode() == 'go':
                 print("Received go message from leader")
+                # stop listening for messages published from the leader
+                pubsubcon.unsubscribe(t_global.args.roadblock_uuid + '__leader')
                 print("Publishing gone message")
                 redcon.publish(t_global.args.roadblock_uuid + '__followers', t_global.args.roadblock_follower_id + '/gone')
+                print("Cleaning up")
+                cleanup(redcon, pubsubcon)
                 print("Exiting")
                 return(0)
 
@@ -189,12 +200,12 @@ def main():
 
             if len(followers['gone']) == 0:
                 print("All followers gone")
+                # stop listening for messages published from the followers
+                pubsubcon.unsubscribe(t_global.args.roadblock_uuid + '__followers')
                 print("Cleaning up")
-                cleanup(redcon)
-                break
-
-        print("Exiting")
-        return(0)
+                cleanup(redcon,pubsubcon)
+                print("Exiting")
+                return(0)
 
 if __name__ == "__main__":
     exit(main())
