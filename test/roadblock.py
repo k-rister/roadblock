@@ -82,7 +82,6 @@ def main():
     
     mytime = calendar.timegm(time.gmtime())
     timeout = mytime + t_global.args.roadblock_timeout
-    #if t_global.args.roadblock_role == 'leader' and redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
     if redcon.msetnx({t_global.args.roadblock_uuid: mytime}):
         # i am creating the roadblock
         print("Initializing roadblock as first arriving member")
@@ -126,10 +125,6 @@ def main():
                     if t_global.args.roadblock_role == 'follower':
                         print("Received online status from leader")
                     state = 2
-        #else:
-        #    print("No online-status messages received")
-
-        #print("state=%d" % (state))
 
         if state == 1:
             if t_global.args.roadblock_role == 'leader':
@@ -168,7 +163,6 @@ def main():
                 print("All followers ready")
                 print("Publishing go message")
                 redcon.publish(t_global.args.roadblock_uuid + '__leader', "go")
-                state = 4
                 break
     elif t_global.args.roadblock_role == 'follower':
         for msg in pubsubcon.listen():
