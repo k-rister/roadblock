@@ -17,7 +17,7 @@ class t_global(object):
     first = False
 
 def process_options ():
-    parser = argparse.ArgumentParser(usage="roadblock testing");
+    parser = argparse.ArgumentParser(description="Roadblock provides multi entity (system, vm, container, etc.) synchronization.");
 
     parser.add_argument('--uuid',
                         dest = 'roadblock_uuid',
